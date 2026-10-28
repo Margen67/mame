@@ -547,6 +547,23 @@ void model2_state::model2_3d_process_polygon(raster_state *raster, u32 attr)
 
 /***********************************************************************************************/
 
+// change the internal resolution multiplier; reallocates the render buffers
+void model2_renderer::set_scale(int scale)
+{
+	scale = std::max(scale, 1);
+	if (scale == m_scale)
+		return;
+
+	// make sure no worker thread is still drawing into the buffers we're about to replace
+	wait("Resolution change");
+
+	m_scale = scale;
+	m_destmap.resize(512 * scale, 512 * scale);
+	m_fillmap.resize(512 * scale, 512 * scale);
+	m_destmap.fill(0x00000000);
+	m_fillmap.fill(0x00);
+}
+
 void model2_renderer::model2_3d_render(polygon *poly, const rectangle &cliprect)
 {
 	m2_poly_extra_data& extra = object_data().next();
@@ -554,8 +571,10 @@ void model2_renderer::model2_3d_render(polygon *poly, const rectangle &cliprect)
 	/* select renderer based on attributes (bit14 = textured, bit13 = transparent) */
 	u8 renderer = (poly->texheader[0] >> 13) & 3;
 
-	/* calculate and clip to viewport */
+	/* calculate the viewport in native pixels, scale it up to the internal resolution, and clip it */
 	rectangle vp(poly->viewport[0] + m_xoffs, poly->viewport[2] + m_xoffs, (384-poly->viewport[3]) + m_yoffs, (384-poly->viewport[1]) + m_yoffs);
+	if (m_scale > 1)
+		vp.set(vp.min_x * m_scale, (vp.max_x + 1) * m_scale - 1, vp.min_y * m_scale, (vp.max_y + 1) * m_scale - 1);
 	vp &= cliprect;
 
 	extra.state = &m_state;
@@ -642,11 +661,22 @@ void model2_state::vertical_sync_w(u16 data)
 /* 3D Rasterizer projection: projects a polygon into screen coordinates */
 inline void model2_state::model2_3d_project(polygon *poly)
 {
+	// The rasterizer treats pixel i as covering [i, i+1), so multiplying native screen
+	// coordinates by the scale factor lines up each native pixel with a scale x scale block.
+	// Everything derived from the vertices (edge slopes, perspective-correct texture
+	// gradients) scales along with them; LOD selection depends only on depth, so textures
+	// keep the same mip levels and simply get sampled more finely.
+	const float scale = float(m_renderer->scale());
+
 	for (int i = 0; i < poly->num_vertices; i++)
 	{
 		/* project the vertices */
 		poly->v[i].x = m_crtc_xoffset + poly->center[0] + (poly->v[i].x / (poly->v[i].pz + std::numeric_limits<float>::min()));
 		poly->v[i].y = ((384 - poly->center[1])+m_crtc_yoffset) - (poly->v[i].y / (poly->v[i].pz + std::numeric_limits<float>::min()));
+
+		/* scale to the internal resolution */
+		poly->v[i].x *= scale;
+		poly->v[i].y *= scale;
 	}
 }
 
@@ -2461,6 +2491,13 @@ void model2_state::video_start()
 
 	m_sys24_bitmap.allocate(width, height+4);
 
+	// remember the native screen geometry so the internal resolution can be scaled from it
+	m_native_visarea = visarea;
+	m_native_width = m_screen->width();
+	m_native_height = m_screen->height();
+	m_cur_scale = 1;
+	m_fb_native.allocate(width, height);
+
 	m_renderer = std::make_unique<model2_renderer>(*this);
 
 	/* initialize the hardware rasterizer */
@@ -2496,8 +2533,54 @@ void model2_state::video_start()
 	save_pointer(NAME(m_gamma_table), 256);
 }
 
+// Apply the user's resolution scale setting by reconfiguring the screen to N times its native
+// size. The pixel clock and totals scale together, so refresh rate and vblank timing don't change.
+// Called from vblank; screen_update() picks the new size up from the screen's visible area.
+void model2_state::update_resolution_scale()
+{
+	if (!m_res_scale_port.found() || (m_native_width == 0))
+		return;
+
+	const int scale = std::clamp<int>(m_res_scale_port->read(), 1, 4);
+	if (scale == m_cur_scale)
+		return;
+
+	m_cur_scale = scale;
+	const rectangle visarea(0, m_native_visarea.width() * scale - 1, 0, m_native_visarea.height() * scale - 1);
+	m_screen->configure(m_native_width * scale, m_native_height * scale, visarea, m_screen->frame_period());
+}
+
+// Copy a native-resolution bitmap into the (larger) screen bitmap, replicating each source pixel
+// into a scale x scale block. This is plain pixel replication used for the 2D layers, which are
+// native-resolution by nature; it does not interpolate or filter anything.
+void model2_state::scale_blit(bitmap_rgb32 &dest, const bitmap_rgb32 &src, const rectangle &cliprect, int scale, bool transparent)
+{
+	for (int y = cliprect.min_y; y <= cliprect.max_y; y++)
+	{
+		const u32 *const s = &src.pix(y / scale);
+		u32 *const d = &dest.pix(y);
+		for (int x = cliprect.min_x; x <= cliprect.max_x; x++)
+		{
+			const u32 pix = s[x / scale];
+			if (!transparent || (pix != 0))
+				d[x] = pix;
+		}
+	}
+}
+
 u32 model2_state::screen_update(screen_device &screen, bitmap_rgb32 &bitmap, const rectangle &cliprect)
 {
+	// work out the internal resolution scale from the size of the screen we've been handed
+	const int scale = std::max(1, screen.visible_area().width() / m_native_visarea.width());
+	if (scale != m_renderer->scale())
+	{
+		// the old 3D image is discarded; the next frame from the geometrizer is drawn at the new size
+		m_renderer->set_scale(scale);
+	}
+
+	// the tilemaps work in native pixels
+	const rectangle native_clip = (scale == 1) ? cliprect : rectangle(cliprect.min_x / scale, cliprect.max_x / scale, cliprect.min_y / scale, cliprect.max_y / scale);
+
 	// if the scroll color table was written to, we need to refresh the palette
 	if (m_palette_dirty)
 	{
@@ -2516,29 +2599,46 @@ u32 model2_state::screen_update(screen_device &screen, bitmap_rgb32 &bitmap, con
 
 	//logerror("--- frame ---\n");
 	bitmap.fill(m_palette->pen(0), cliprect);
-	m_sys24_bitmap.fill(0, cliprect);
+	m_sys24_bitmap.fill(0, native_clip);
 
 	// draw tilemap B as opaque
 	for (int layer = 3; layer >= 2; layer--)
-		m_tiles->draw(screen, m_sys24_bitmap, cliprect, layer << 1, 0, TILEMAP_DRAW_OPAQUE);
+		m_tiles->draw(screen, m_sys24_bitmap, native_clip, layer << 1, 0, TILEMAP_DRAW_OPAQUE);
 
 	for (int layer = 1; layer >= 0; layer--)
-		m_tiles->draw(screen, m_sys24_bitmap, cliprect, layer << 1, 0, 0);
+		m_tiles->draw(screen, m_sys24_bitmap, native_clip, layer << 1, 0, 0);
 
-	copybitmap_trans(bitmap, m_sys24_bitmap, 0, 0, 0, 0, cliprect, 0);
+	if (scale == 1)
+		copybitmap_trans(bitmap, m_sys24_bitmap, 0, 0, 0, 0, cliprect, 0);
+	else
+		scale_blit(bitmap, m_sys24_bitmap, cliprect, scale, true);
 
 	/* tell the rasterizer we're starting a frame */
 	if (m_render_test_mode == true)
-		draw_framebuffer(bitmap, cliprect);
+	{
+		if (scale == 1)
+		{
+			draw_framebuffer(bitmap, cliprect);
+		}
+		else
+		{
+			m_fb_native.fill(m_palette->pen(0), native_clip);
+			draw_framebuffer(m_fb_native, native_clip);
+			scale_blit(bitmap, m_fb_native, cliprect, scale, false);
+		}
+	}
 	else
 		render_polygons(bitmap, cliprect);
 
-	m_sys24_bitmap.fill(0, cliprect);
+	m_sys24_bitmap.fill(0, native_clip);
 
 	for (int layer = 3; layer >= 0; layer--)
-		m_tiles->draw(screen, m_sys24_bitmap, cliprect, (layer<<1) | 1, 0, 0);
+		m_tiles->draw(screen, m_sys24_bitmap, native_clip, (layer<<1) | 1, 0, 0);
 
-	copybitmap_trans(bitmap, m_sys24_bitmap, 0, 0, 0, 0, cliprect, 0);
+	if (scale == 1)
+		copybitmap_trans(bitmap, m_sys24_bitmap, 0, 0, 0, 0, cliprect, 0);
+	else
+		scale_blit(bitmap, m_sys24_bitmap, cliprect, scale, true);
 
 	return 0;
 }

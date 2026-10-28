@@ -76,6 +76,7 @@ public:
 		m_in0(*this, "IN0"),
 		m_gears(*this, "GEARS"),
 		m_lightgun_ports(*this, {"P1_Y", "P1_X", "P2_Y", "P2_X"}),
+		m_res_scale_port(*this, "RESSCALE"),
 		m_lamps(*this, "lamp%u", 0U)
 	{ }
 
@@ -138,6 +139,7 @@ protected:
 	required_ioport m_in0;
 	optional_ioport m_gears;
 	optional_ioport_array<4> m_lightgun_ports;
+	optional_ioport m_res_scale_port;   // internal resolution scale (only defined by drivers that opt in)
 	output_finder<6> m_lamps;
 
 	u32 m_timervals[4]{};
@@ -153,6 +155,19 @@ protected:
 	std::unique_ptr<raster_state> m_raster;
 	std::unique_ptr<geo_state> m_geo;
 	bitmap_rgb32 m_sys24_bitmap;
+
+	// Internal resolution scaling. The 3D rasterizer renders into a buffer that is
+	// m_cur_scale times larger in each dimension than the native 496x384 image, and the
+	// screen itself is reconfigured to that size (refresh rate/vblank timing unchanged).
+	// The 2D tile layers are always drawn natively and replicated into the larger image.
+	bitmap_rgb32 m_fb_native;           // native-size scratch used by the render test mode framebuffer
+	rectangle m_native_visarea;         // native visible area (before scaling)
+	s32 m_native_width = 0;             // native total horizontal size
+	s32 m_native_height = 0;            // native total vertical size
+	int m_cur_scale = 1;                // scale currently applied to the screen
+	void update_resolution_scale();
+	void scale_blit(bitmap_rgb32 &dest, const bitmap_rgb32 &src, const rectangle &cliprect, int scale, bool transparent);
+
 	u8 m_gearsel = 0;
 	u8 m_lightgun_mux = 0;
 
@@ -679,12 +694,17 @@ public:
 		m_destmap(512, 512),
 		m_fillmap(512, 512),
 		m_xoffs(90),
-		m_yoffs(-8)
+		m_yoffs(-8),
+		m_scale(1)
 	{
 	}
 
 	bitmap_rgb32 &destmap() { return m_destmap; }
 	bitmap_ind8 &fillmap() { return m_fillmap; }
+
+	// internal resolution multiplier; the render buffers are (512 * scale) squared
+	int scale() const { return m_scale; }
+	void set_scale(int scale);
 
 	void model2_3d_render(polygon *poly, const rectangle &cliprect);
 	void set_xoffset(int16_t xoffs) { m_xoffs = xoffs; }
@@ -703,6 +723,7 @@ private:
 	bitmap_rgb32 m_destmap;
 	bitmap_ind8 m_fillmap;
 	int16_t m_xoffs, m_yoffs;
+	int m_scale;
 
 	template <bool Translucent>
 	u32 fetch_bilinear_texel(const m2_poly_extra_data& object, s32 miplevel, s32 fu, s32 fv);

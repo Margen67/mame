@@ -2201,6 +2201,14 @@ INPUT_PORTS_START( schamp )
 	PORT_BIT(0x02, IP_ACTIVE_LOW, IPT_BUTTON2) PORT_PLAYER(2) PORT_NAME("P2 Kick")
 	PORT_BIT(0x04, IP_ACTIVE_LOW, IPT_BUTTON3) PORT_PLAYER(2) PORT_NAME("P2 Barrier")
 	PORT_BIT(0x08, IP_ACTIVE_LOW, IPT_UNUSED)
+
+	// Internal resolution scaling for the 3D rasterizer (not a hardware setting)
+	PORT_START("RESSCALE")
+	PORT_CONFNAME(0x07, 0x01, "3D Resolution Scale")
+	PORT_CONFSETTING(   0x01, "1x (native 496x384)")
+	PORT_CONFSETTING(   0x02, "2x (992x768)")
+	PORT_CONFSETTING(   0x03, "3x (1488x1152)")
+	PORT_CONFSETTING(   0x04, "4x (1984x1536)")
 INPUT_PORTS_END
 
 static INPUT_PORTS_START( sgt24h )
@@ -2428,6 +2436,9 @@ void model2_state::screen_vblank(int state)
 		return;
 
 	m_framenum = m_screen->frame_number();
+
+	// pick up changes to the internal resolution setting (no-op for drivers without the option)
+	update_resolution_scale();
 
 	// if 60 Hz mode or frame number is even, trigger geometrizer to start new frame
 	if ((m_videocontrol & 1) == 0 || (m_framenum & 1) == 0)
